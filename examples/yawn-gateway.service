@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 The YAWN authors
+# SPDX-License-Identifier: Apache-2.0
+# Edit the lines marked EDIT, then: cp yawn-gateway.service /etc/systemd/system/ && systemctl enable --now yawn-gateway
+[Unit]
+Description=YAWN gateway for LLM servers that run as Slurm jobs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# EDIT: the account that owns the model's Slurm jobs. No root, no GPU.
+User=llm
+# EDIT: the config, the job script, keys and the request log live here.
+WorkingDirectory=/home/llm/yawn
+# /run/yawn holds the key socket: owned by User, not writable by others.
+RuntimeDirectory=yawn
+ExecStart=/usr/bin/yawn-gateway config.json
+UMask=0077
+LimitNOFILE=65536
+Restart=on-failure
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+name: Feature request
+description: Something your site needs that is missing
+labels: ["enhancement"]
+body:
+  - type: textarea
+    attributes:
+      label: The situation at your site
+      description: What you are trying to offer, to whom, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What would help
+    validations:
+      required: true

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yawn-slurm"
+dynamic = ["version"]
+description = "An OpenAI-compatible gateway that starts LLM servers as Slurm jobs on request and stops them when idle."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "The YAWN authors" }]
+keywords = ["slurm", "hpc", "llm", "inference", "gateway", "vllm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.scripts]
+yawn-gateway = "yawn.gateway:main"
+llm-key = "yawn.key:main"
+llm-up = "yawn.up:main"
+llm-batch = "yawn.batch:main"
+
+[tool.setuptools]
+packages = ["yawn"]
+
+[tool.setuptools.dynamic]
+version = { attr = "yawn.__version__" }
+
+[tool.ruff]
+line-length = 140

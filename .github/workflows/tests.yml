@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Gateway (fake Slurm and a fake model server; no GPU needed)
+        run: python tests/run_tests.py
+      - name: Settlement self-test
+        run: python contrib/slurm-settle/settle.py selftest
+      - name: Install and run the commands
+        run: |
+          pip install .
+          yawn-gateway --version
+          llm-up --help

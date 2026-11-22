@@ -1,0 +1,7 @@
+{
+  "listen": "192.0.2.10:8080",
+  "key_socket": "/run/yawn/key.sock",
+  "models": {
+    "Qwen/Qwen2.5-7B-Instruct": {"sbatch": "model.sbatch"}
+  }
+}

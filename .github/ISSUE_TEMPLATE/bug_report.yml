@@ -1,0 +1,21 @@
+name: Bug report
+description: Something does not work as described
+labels: ["bug"]
+body:
+  - type: textarea
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Your site
+      description: Slurm version, Python version, the model server (e.g. vLLM and its version), where the gateway runs, and how users reach it.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Logs
+      description: The gateway's log around the time of the problem and, if a job was involved, `squeue`/`sacct` lines for it. Remove user names and keys.
+      render: text
