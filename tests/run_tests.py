@@ -387,6 +387,25 @@ def main():
         check("a key socket in /tmp is refused at start (it could be taken over first)", *refused({"key_socket": "/tmp/yawn-test-squat.sock"}, "refusing"))
         check("an unknown setting is refused at start, with its name", *refused({"idle_stop": 5}, "idle_stop"))
         check("a config without models is refused at start, without a traceback", *refused({"models": {}}, "models"))
+        slow = json.load(open(os.path.join(W, "edge.json")))["models"]["slow"]
+        check("a number written as a string is refused at start, with its name", *refused({"poll_s": "5"}, "poll_s"))
+        r = subprocess.run([sys.executable, "-m", "yawn.gateway", os.path.join(W, "bad.json"), "--check"], env=ENV, cwd=W,
+                           capture_output=True, text=True, timeout=10)
+        check("a number written as a string: --check refuses it too",
+              r.returncode != 0 and "poll_s" in r.stderr and "Traceback" not in r.stderr,
+              r.stdout[-200:] + r.stderr[-200:])
+        check("a timeout of 0 is refused at start", *refused({"backend_timeout_s": 0}, "backend_timeout_s"))
+        check("true/false written as a string is refused at start", *refused({"own_jobs": "false"}, "own_jobs"))
+        check("a busy status that is not an HTTP error is refused at start", *refused({"busy_status": 200}, "busy_status"))
+        check("a model's number written as a string is refused at start", *refused({"models": {"slow": {**slow, "slots": "2"}}}, "slots"))
+        check("a model without a job script path is refused at start", *refused({"models": {"slow": {**slow, "sbatch": None}}}, "sbatch"))
+        check("a job name the gateway could not find in squeue's output is refused at start",
+              *refused({"models": {"slow": {**slow, "job_name": "a|b"}}}, "job_name"))
+        check("an unknown Slurm command setting is refused at start, with its name", *refused({"slurm": {"sqeue": "squeue"}}, "sqeue"))
+        check("an unknown message is refused at start, with its name", *refused({"messages": {"loadng": "wait"}}, "loadng"))
+        check("a message or busy_hint that cannot be filled in is refused at start",
+              refused({"busy_hint": " run: llm-up {modle}"}, "busy_hint")[0] and refused({"messages": {"loading": "{s.x}"}}, "loading")[0])
+        check("a url without http:// is refused at start", *refused({"url": "192.0.2.10:8080"}, "url"))
         check("an IPv6 listen address is refused at start, saying so", *refused({"listen": f"::1:{BASE + 6}"}, "IPv6"))
         check("a port out of range is refused at start", *refused({"listen": "127.0.0.1:99999"}, "1-65535"))
         check("an address already in use is refused at start, with the address",

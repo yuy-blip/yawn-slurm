@@ -74,6 +74,9 @@ Who used how much is in `ledger.jsonl` (one line per request, with the user and 
 
 ## Options
 
+Write numbers as JSON numbers and `true`/`false` as such, not in quotes. The gateway checks the type and range of
+every setting when it starts (and with `--check`) and stops at the first one it cannot use, naming it.
+
 Per model:
 
 | key | default | meaning |
