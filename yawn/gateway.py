@@ -86,6 +86,49 @@ def expected(j):
     return f" (Slurm expects about {t:%m-%d %H:%M})" if j["state"] == "PENDING" and t > datetime.now() else ""
 
 
+def num(d, key, default, where="", low=0, above=False, whole=False, high=None):
+    """A number from the config: a JSON number (not a string, not true or false), at least `low` (above it with
+    `above`) and at most `high` (or 1e9); anything else stops the start, naming the setting."""
+    v = d.get(key, default)
+    try:
+        ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= low and not (above and v == low) \
+            and v <= (1e9 if high is None else high) and not (whole and v != int(v))
+    except OverflowError:  # an integer too large for a float
+        ok = False
+    if not ok:
+        limit = f" and at most {high}" if high is not None else " and at most 1e9" if isinstance(v, (int, float)) and v > 1e9 else ""
+        sys.exit(f"{where}`{key}` must be {'a whole number' if whole else 'a number'} {'above' if above else 'of at least'} {low}"
+                 f"{limit}, not {json.dumps(v)}")
+    return int(v) if whole else v
+
+
+def flag(d, key, default, where=""):
+    v = d.get(key, default)
+    if not isinstance(v, bool):
+        sys.exit(f"{where}`{key}` must be true or false, not {json.dumps(v)}")
+    return v
+
+
+def text(d, key, default, where="", required=False):
+    v = d.get(key, default)
+    if not (isinstance(v, str) and (v or not required)) and not (v is None and default is None and not required):
+        sys.exit(f"{where}`{key}` must be {'a non-empty string' if required else 'a string'}, not {json.dumps(v)}")
+    if v and "\0" in v:
+        sys.exit(f"{where}`{key}` cannot hold a NUL character")
+    return v
+
+
+def texts(d, key, default, where=""):
+    """A string or a list of strings -> a list of strings."""
+    v = d.get(key, default)
+    v = [v] if isinstance(v, str) else v
+    if not isinstance(v, list) or not v or not all(isinstance(x, str) and x for x in v):
+        sys.exit(f"{where}`{key}` must be a string or a list of strings, not {json.dumps(d.get(key, default))}")
+    if any("\0" in x for x in v):
+        sys.exit(f"{where}`{key}` cannot hold a NUL character")
+    return v
+
+
 def write_private(path, text):
     """Replace a file atomically; only this account can read it."""
     tmp = path + ".tmp"
@@ -215,24 +258,30 @@ class Model:
     on Slurm except submit() and cancel(), which run one command each."""
 
     def __init__(self, name, c, gw):
+        where = f"model {name!r}: "
+        if not isinstance(c, dict):
+            sys.exit(f"{where}its settings must be a JSON object")
         unknown = set(c) - MODEL_KEYS
         if unknown:
-            sys.exit(f"model {name!r}: unknown setting(s) {', '.join(sorted(unknown))}")
+            sys.exit(f"{where}unknown setting(s) {', '.join(sorted(unknown))}")
         if "sbatch" not in c:
-            sys.exit(f"model {name!r}: `sbatch` (the job script) is missing")
+            sys.exit(f"{where}`sbatch` (the job script) is missing")
         self.name, self.gw = name, gw
-        self.sbatch = os.path.expanduser(c["sbatch"])
-        self.batch_sbatch = os.path.expanduser(c["batch_sbatch"]) if c.get("batch_sbatch") else None
-        self.job_name = c.get("job_name", "yawn-" + re.sub(r"[^A-Za-z0-9._-]+", "-", name))
-        self.queue = FairQueue(int(c.get("slots", 32)), gw.meter, gw.max_waiting)  # 0 = no limit (and no fair order)
-        self.weight = float(c.get("billing_weight", 1.0))
+        self.sbatch = os.path.expanduser(text(c, "sbatch", None, where, required=True))
+        self.batch_sbatch = os.path.expanduser(c["batch_sbatch"]) if text(c, "batch_sbatch", None, where) else None
+        self.job_name = text(c, "job_name", "yawn-" + re.sub(r"[^A-Za-z0-9._-]+", "-", name), where, required=True)
+        if "|" in self.job_name or not self.job_name.isprintable():  # squeue's output is read as lines split at "|"
+            sys.exit(f"{where}`job_name` cannot hold '|' or characters that cannot be printed, such as tabs or line breaks"
+                     f" (the gateway finds its job in squeue's output by splitting lines at '|'), not {self.job_name!r}")
+        self.queue = FairQueue(num(c, "slots", 32, where, whole=True), gw.meter, gw.max_waiting)  # 0 = no limit (and no fair order)
+        self.weight = num(c, "billing_weight", 1.0, where)
         # vLLM reuses computed prefixes between requests; timing then tells one user what another sent. A per-user
         # `cache_salt` keeps each user's cache apart. Turn off for a server that rejects the field.
-        self.cache_salt = bool(c.get("cache_salt", True))
-        self.startup_s = int(c.get("startup_s", 300))  # how long loading usually takes (for messages)
-        self.start_timeout_s = int(c.get("start_timeout_s", 1800))  # a running job that is not ready by then is cancelled
-        self.idle_stop_s = int(c.get("idle_stop_s", 1800))  # cancel the job after this long without a request; 0 = never
-        self.retry_s = int(c.get("retry_after_failure_s", 600))  # crash-loop guard
+        self.cache_salt = flag(c, "cache_salt", True, where)
+        self.startup_s = num(c, "startup_s", 300, where, whole=True)  # how long loading usually takes (for messages)
+        self.start_timeout_s = num(c, "start_timeout_s", 1800, where, above=True)  # a running job not ready by then is cancelled
+        self.idle_stop_s = num(c, "idle_stop_s", 1800, where)  # cancel the job after this long without a request; 0 = never
+        self.retry_s = num(c, "retry_after_failure_s", 600, where, whole=True)  # crash-loop guard (also sent as Retry-After)
         self.lock = threading.Lock()
         self.job = None  # dict(id, state, reason, node, start) as last seen in squeue, or None
         self.running_since = None  # (job id, monotonic time it was first seen RUNNING)
@@ -458,10 +507,14 @@ class Gateway:
         if not isinstance(cfg.get("models"), dict) or not cfg["models"]:
             sys.exit("the config needs `models`: {\"MODEL NAME\": {\"sbatch\": \"/path/to/job/script\"}}")
         self.cfg = cfg
-        self.slurm = {k: (v if isinstance(v, list) else [v]) for k, v in
-                      {"sbatch": "sbatch", "squeue": "squeue", "scancel": "scancel", **cfg.get("slurm", {})}.items()}
-        listen = cfg.get("listen", "127.0.0.1:8080")
-        self.listen = list(listen) if isinstance(listen, list) else [listen]
+        slurm = cfg.get("slurm", {})
+        if not isinstance(slurm, dict):
+            sys.exit("`slurm` must be a JSON object, e.g. {\"squeue\": \"/usr/bin/squeue\"}")
+        if set(slurm) - {"sbatch", "squeue", "scancel"}:
+            sys.exit(f"slurm: unknown setting(s) {', '.join(sorted(set(slurm) - {'sbatch', 'squeue', 'scancel'}))}")
+        self.slurm = {k: texts(slurm, k, k, "slurm: ") for k in ("sbatch", "squeue", "scancel")}  # a command, or a list of words
+        self.listen = list(texts(cfg, "listen", "127.0.0.1:8080"))
+        text(cfg, "key_socket", None)  # opened by main()
         for i, a in enumerate(self.listen):
             if a.startswith("unix:"):
                 if a == "unix:":
@@ -484,30 +537,47 @@ class Gateway:
         if len(set(self.listen)) != len(self.listen) or len(set(places)) != len(places):
             sys.exit("listen and key_socket: the same address or socket file is named twice")
         tcp = [a for a in self.listen if not a.startswith("unix:")]
-        self.url = (cfg.get("url") or ("http://" + tcp[0] if tcp else "")).rstrip("/")  # where jobs and users reach the gateway
-        self.poll_s = cfg.get("poll_s", 5)
-        self.beat_ttl_s = cfg.get("beat_ttl_s", 45)  # a worker that has not registered for this long is not used
-        self.max_waiting = int(cfg.get("max_waiting_per_user", 64))
-        self.meter = Meter(cfg.get("usage", "usage.json"), float(cfg.get("halflife_days", 7)) * 86400)
+        url = text(cfg, "url", None)
+        if url and not re.match(r"https?://", url, re.I):
+            sys.exit(f"url: {url!r} must start with http:// or https://")
+        self.url = (url or ("http://" + tcp[0] if tcp else "")).rstrip("/")  # where jobs and users reach the gateway
+        self.poll_s = num(cfg, "poll_s", 5, above=True)
+        self.beat_ttl_s = num(cfg, "beat_ttl_s", 45, above=True)  # a worker that has not registered for this long is not used
+        self.max_waiting = num(cfg, "max_waiting_per_user", 64, low=1, whole=True)
+        self.meter = Meter(text(cfg, "usage", "usage.json", required=True), num(cfg, "halflife_days", 7, above=True) * 86400)
         self.models = {n: Model(n, c, self) for n, c in cfg["models"].items()}
         names = [m.job_name for m in self.models.values()]
         if len(set(names)) != len(names):
             sys.exit("two models have the same job name; set `job_name` for one of them")
-        self.keys_path = cfg.get("keys", "keys.json")
-        self.ledger_path = cfg.get("ledger", "ledger.jsonl")
-        self.state_path = cfg.get("state", "jobs.json")
-        self.hold_s = cfg.get("hold_s", 20)  # how long to keep a request open while Slurm keeps the job waiting
-        self.hold_loading_s = cfg.get("hold_loading_s", 300)  # ... while the job runs and the model loads
-        self.queue_wait_s = cfg.get("queue_wait_s", 600)  # ... while waiting for a slot behind other requests
-        self.backend_timeout_s = cfg.get("backend_timeout_s", 600)  # ... for the model to send the next bytes
-        self.own_jobs = bool(cfg.get("own_jobs", True))
-        self.busy_status = cfg.get("busy_status", 503)
-        self.busy_hint = cfg.get("busy_hint", "")  # e.g. " To use it now as your own job, run: llm-up {model}"
-        self.msg = {**DEFAULT_MSG, **cfg.get("messages", {})}
-        self.paths = set(cfg.get("paths", DEFAULT_PATHS))  # only the model API is passed on
-        self.max_body = int(cfg.get("max_body_mb", 32)) * 2 ** 20
-        self.client_timeout_s = cfg.get("client_timeout_s", 60)  # a client that sends nothing for this long is dropped
-        self.conn_slots = threading.BoundedSemaphore(int(cfg.get("max_connections", 512)))
+        self.keys_path = text(cfg, "keys", "keys.json", required=True)
+        self.ledger_path = text(cfg, "ledger", "ledger.jsonl", required=True)
+        self.state_path = text(cfg, "state", "jobs.json", required=True)
+        self.hold_s = num(cfg, "hold_s", 20)  # how long to keep a request open while Slurm keeps the job waiting
+        self.hold_loading_s = num(cfg, "hold_loading_s", 300)  # ... while the job runs and the model loads
+        self.queue_wait_s = num(cfg, "queue_wait_s", 600)  # ... while waiting for a slot behind other requests
+        self.backend_timeout_s = num(cfg, "backend_timeout_s", 600, above=True)  # ... for the model to send the next bytes
+        self.own_jobs = flag(cfg, "own_jobs", True)
+        self.busy_status = num(cfg, "busy_status", 503, low=400, high=599, whole=True)  # an HTTP error status
+        self.busy_hint = text(cfg, "busy_hint", None) or ""  # e.g. " To use it now as your own job, run: llm-up {model}"
+        msg = cfg.get("messages", {})
+        if not isinstance(msg, dict):
+            sys.exit("`messages` must be a JSON object")
+        if set(msg) - set(DEFAULT_MSG):
+            sys.exit(f"messages: unknown message(s) {', '.join(sorted(set(msg) - set(DEFAULT_MSG)))}"
+                     f" (known: {', '.join(DEFAULT_MSG)})")
+        self.msg = {**DEFAULT_MSG, **{k: text(msg, k, "", "messages: ") for k in msg}}
+        fill = [(f"messages: {k}", v, dict(s=60, at="", reason="")) for k, v in self.msg.items()]
+        for where, v, values in fill + [("busy_hint", self.busy_hint, dict(model="m"))]:
+            try:  # a text that cannot be filled in would fail on the request that needs it
+                v.format(**values)
+            except Exception as e:  # noqa: BLE001  (KeyError, AttributeError, IndexError, TypeError, ValueError ...)
+                sys.exit(f"{where}: cannot fill in {v!r} ({type(e).__name__}: {e}); it may use"
+                         f" {', '.join('{' + n + '}' for n in values)}")
+        self.paths = set(texts(cfg, "paths", DEFAULT_PATHS))  # only the model API is passed on
+        self.max_body_mb = num(cfg, "max_body_mb", 32, above=True)
+        self.max_body = int(self.max_body_mb * 2 ** 20)
+        self.client_timeout_s = num(cfg, "client_timeout_s", 60, above=True)  # a client that sends nothing for this long is dropped
+        self.conn_slots = threading.BoundedSemaphore(num(cfg, "max_connections", 512, low=1, whole=True))
         self.keys_lock = threading.Lock()
         self.ledger_lock = threading.Lock()
         self.state_lock = threading.Lock()
@@ -830,7 +900,7 @@ def make_handler(gw):
             if n < 0 or self.headers.get("Transfer-Encoding"):
                 return self.error(400, "invalid_request", "Send the body with a Content-Length.")
             if n > gw.max_body:
-                return self.error(413, "request_too_large", f"The request body is larger than {gw.max_body >> 20} MB.")
+                return self.error(413, "request_too_large", f"The request body is larger than {json.dumps(gw.max_body_mb)} MB.")
             try:
                 body = json.loads(self.rfile.read(n) or b"{}")
             except (ValueError, OSError):
