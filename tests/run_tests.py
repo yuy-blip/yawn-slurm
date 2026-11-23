@@ -428,6 +428,33 @@ def main():
         check("client hangs up mid-stream: client_gone, partly booked, the model still answers at once",
               last["status"] == "client_gone" and 0 < last["billed"] < 3 and code == 200 and int(fs("count")) == n0, f"{last} {code}")
 
+        # ---- state files that are valid JSON but not what the gateway writes ----
+        open(os.path.join(W, "odd-usage.json"), "w").write('{"t": 0, "usage": [1]}')
+        open(os.path.join(W, "odd-jobs.json"), "w").write("[1, 2]")
+        c = {**json.load(open(os.path.join(W, "edge.json"))), "listen": f"127.0.0.1:{BASE + 6}", "usage": "odd-usage.json",
+             "state": "odd-jobs.json"}
+        json.dump(c, open(os.path.join(W, "odd.json"), "w"))
+        odd = subprocess.Popen([sys.executable, "-m", "yawn.gateway", os.path.join(W, "odd.json")], env=ENV, cwd=W,
+                               stderr=subprocess.PIPE, text=True)
+        up = False
+        try:
+            for _ in range(50):
+                try:
+                    up = urllib.request.urlopen(f"http://127.0.0.1:{BASE + 6}/gw/status", timeout=2).status == 200
+                    break
+                except OSError:
+                    time.sleep(0.2)
+        finally:
+            odd.terminate()
+            try:
+                err = odd.communicate(timeout=10)[1]
+            except subprocess.TimeoutExpired:
+                odd.kill()
+                err = odd.communicate()[1]
+        check("usage and job state files that are valid JSON but not what the gateway writes: it starts, says they were not used",
+              up and err.count("not used") == 2 and "Traceback" not in err, err[-300:])
+
+
         # ---- usage is measured with a clock that does not jump ----
         sys.path.insert(0, ROOT)
         from unittest import mock
@@ -444,6 +471,13 @@ def main():
         json.dump(d, open(os.path.join(W, "clock.json"), "w"))
         check("usage: across a restart the time down only decays usage",
               abs(gwmod.Meter(os.path.join(W, "clock.json"), 7 * 86400).usage["zed"] - 50.0) < 0.5)
+        with mock.patch.object(gwmod, "log"):  # the gateway's "not used" lines would look like errors in this log
+            json.dump({"usage": {"zed": 100.0}}, open(os.path.join(W, "clock.json"), "w"))  # no time saved: cannot decay
+            check("usage: a file without its time is not used at all (not kept undecayed)",
+                  gwmod.Meter(os.path.join(W, "clock.json"), 7 * 86400).usage == {})
+            json.dump({"t": time.time(), "usage": {"zed": "x"}}, open(os.path.join(W, "clock.json"), "w"))
+            check("usage: a file with a value that is not a number is not used (it would break the next save)",
+                  gwmod.Meter(os.path.join(W, "clock.json"), 7 * 86400).usage == {})
 
         # ---- no GPU held for nothing ----
         code, _, _ = wait_ok("idle")

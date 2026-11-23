@@ -27,6 +27,7 @@ import hashlib  # noqa: E402
 import hmac  # noqa: E402
 import itertools  # noqa: E402
 import json  # noqa: E402
+import math  # noqa: E402
 import os  # noqa: E402
 import pwd  # noqa: E402
 import re  # noqa: E402
@@ -105,13 +106,21 @@ class Meter:
         try:
             with open(path) as f:
                 d = json.load(f)
-            self.usage = d["usage"]
-            down = time.time() - float(d["t"])  # across a restart only the wall clock is known: decay, never book
-            if down > 0:
-                k = 0.5 ** (down / self.hl)
-                self.usage = {u: v * k for u, v in self.usage.items()}
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
+            usage, saved = d["usage"], d["t"]
+
+            def number(v):
+                return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+            if not number(saved) or not isinstance(usage, dict) or not all(number(v) and v >= 0 for v in usage.values()):
+                raise ValueError("not the form this gateway writes")
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as e:
+            log(f"usage from {path} not used: {e!r}")
+            return
+        down = time.time() - saved  # across a restart only the wall clock is known: decay, never book
+        k = 0.5 ** (down / self.hl) if down > 0 else 1.0
+        self.usage = {u: v * k for u, v in usage.items()}
 
     def _tick(self):
         now = time.monotonic()
@@ -487,11 +496,15 @@ class Gateway:
         try:
             with open(self.state_path) as f:
                 d = json.load(f)
-        except (OSError, ValueError):
+            if not isinstance(d, dict):
+                raise ValueError("not the form this gateway writes")
+        except FileNotFoundError:
             return
+        except (OSError, ValueError, RecursionError) as e:
+            return log(f"job state from {self.state_path} not used: {e!r}")
         for name, s in d.items():
             m = self.models.get(name)
-            if m and isinstance(s, dict) and s.get("job") and s.get("token"):
+            if m and isinstance(s, dict) and s.get("job") and isinstance(s.get("token"), str) and s["token"]:
                 m.submitted = {"job": str(s["job"]), "token": s["token"], "t": 0.0}
 
     def save_state(self):
