@@ -420,7 +420,7 @@ def private_place(path, remove=True):
     """Refuse a socket path in a directory others can write to (e.g. /tmp): they could create it first and collect keys.
 
     The directory must belong to this account (or root) and not be writable by group or others. A stale socket of this
-    account is removed.
+    account is removed; one that a running process still answers on is not.
     """
     d = os.path.dirname(os.path.abspath(path))
     try:
@@ -436,6 +436,16 @@ def private_place(path, remove=True):
         return
     if not stat.S_ISSOCK(lst.st_mode) or lst.st_uid != os.getuid():
         sys.exit(f"refusing to replace {path}: it is not a socket owned by this account")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(2)
+        try:
+            s.connect(path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            pass  # nobody listens there: a leftover
+        except OSError as e:  # e.g. a full backlog: someone may still be listening
+            sys.exit(f"refusing to replace {path}: cannot tell whether a process is listening on it ({e})")
+        else:
+            sys.exit(f"refusing to replace {path}: a running process (another gateway?) is listening on it")
     if remove:
         os.remove(path)
 
@@ -451,10 +461,28 @@ class Gateway:
         self.slurm = {k: (v if isinstance(v, list) else [v]) for k, v in
                       {"sbatch": "sbatch", "squeue": "squeue", "scancel": "scancel", **cfg.get("slurm", {})}.items()}
         listen = cfg.get("listen", "127.0.0.1:8080")
-        self.listen = listen if isinstance(listen, list) else [listen]
-        for a in self.listen:
-            if not a.startswith("unix:") and not re.fullmatch(r".+:\d+", a):
+        self.listen = list(listen) if isinstance(listen, list) else [listen]
+        for i, a in enumerate(self.listen):
+            if a.startswith("unix:"):
+                if a == "unix:":
+                    sys.exit("listen: 'unix:' needs a path, e.g. unix:/run/yawn/http.sock")
+                continue
+            if not re.fullmatch(r".+:[0-9]+", a):
                 sys.exit(f"listen: {a!r} is neither HOST:PORT nor unix:/path")
+            host, port = a.rsplit(":", 1)
+            if ":" in host:
+                sys.exit(f"listen: {a!r}: IPv6 addresses are not supported; use an IPv4 address, a host name or unix:/path")
+            port = port.lstrip("0") or "0"
+            if len(port) > 5 or not 0 < int(port) < 65536:
+                sys.exit(f"listen: {a!r}: the port must be 1-65535")
+            self.listen[i] = f"{host}:{port}"  # e.g. "host:08080" -> "host:8080"
+        try:
+            places = [os.path.realpath(os.path.expanduser(p)) for p in
+                      [a[5:] for a in self.listen if a.startswith("unix:")] + ([cfg["key_socket"]] if cfg.get("key_socket") else [])]
+        except ValueError as e:  # e.g. a NUL character, or a name that cannot be encoded
+            sys.exit(f"listen or key_socket: cannot use this path ({e})")
+        if len(set(self.listen)) != len(self.listen) or len(set(places)) != len(places):
+            sys.exit("listen and key_socket: the same address or socket file is named twice")
         tcp = [a for a in self.listen if not a.startswith("unix:")]
         self.url = (cfg.get("url") or ("http://" + tcp[0] if tcp else "")).rstrip("/")  # where jobs and users reach the gateway
         self.poll_s = cfg.get("poll_s", 5)
@@ -613,13 +641,22 @@ class Gateway:
                   for n, m in self.models.items()}
         return {"key": self.key_for(user), "url": self.url, "models": models, "own_jobs": self.own_jobs}
 
-    def key_server(self, path):
-        """Unix socket on the gateway's host: `llm-key` connects, the kernel says who it is, and that user's key is handed out."""
+    @staticmethod
+    def key_socket(path):
+        """The Unix socket `llm-key` connects to. Opened before the gateway says it is listening, so a problem stops the start."""
         private_place(path)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(path)
-        os.chmod(path, 0o666)
-        srv.listen(64)
+        try:
+            srv.bind(path)
+            os.chmod(path, 0o666)
+            srv.listen(64)
+        except OSError:
+            srv.close()
+            raise
+        return srv
+
+    def key_server(self, srv):
+        """`llm-key` connects, the kernel says who it is, and that user's key is handed out."""
 
         def serve(c):
             try:
@@ -627,6 +664,8 @@ class Gateway:
                 _pid, uid, _gid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
                 user = pwd.getpwuid(uid).pw_name
                 cmd = c.recv(64).decode(errors="replace").strip()
+                if cmd not in ("get", "new", "info"):  # e.g. a connect-and-close that checks whether a gateway runs here
+                    return
                 out = json.dumps(self.info(user)) if cmd == "info" else self.key_for(user, new=(cmd == "new"))
                 c.sendall((out + "\n").encode())
             except Exception as e:  # noqa: BLE001
@@ -638,9 +677,19 @@ class Gateway:
             finally:
                 c.close()
 
-        while True:
-            c, _ = srv.accept()
-            threading.Thread(target=serve, args=(c,), daemon=True).start()
+        while True:  # nothing may end this loop: the gateway would go on without handing out keys
+            try:
+                c, _ = srv.accept()
+            except OSError as e:  # e.g. out of file descriptors
+                log(f"key socket: {e}")
+                time.sleep(1)
+                continue
+            try:
+                threading.Thread(target=serve, args=(c,), daemon=True).start()
+            except RuntimeError as e:  # cannot start a thread now
+                log(f"key socket: {e}")
+                c.close()
+                time.sleep(1)
 
     # ---- where: workers register ----
     def register(self, auth, peer, d):
@@ -1079,24 +1128,36 @@ def check(cfg, gw):
         print(("ok    " if ok else "ERROR ") + text)
 
     def place(path):  # -> None if a socket may live there, else why not
+        path = os.path.expanduser(path)
         try:
-            private_place(os.path.expanduser(path), remove=False)
+            if len(os.fsencode(path)) > 107:  # sun_path holds 108 bytes with the closing zero
+                return f"the path is {len(os.fsencode(path))} bytes long; a Unix socket path can have at most 107"
+            private_place(path, remove=False)
         except SystemExit as e:
             return str(e)
+        except (OSError, ValueError) as e:  # e.g. a path that cannot be encoded
+            return f"cannot use this path ({e})"
+        if not os.access(os.path.dirname(os.path.abspath(path)), os.W_OK | os.X_OK):
+            return "this account cannot create a file in its directory"
 
+    bound = []  # held until every address is tried, as the start holds them all
     for addr in gw.listen:
         if addr.startswith("unix:"):
             why = place(addr[5:])
         else:
             host, port = addr.rsplit(":", 1)
             why = None
+            s = socket.socket(socket.AF_INET)  # as TCPServer
+            bound.append(s)
             try:
-                with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as s:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    s.bind((host, int(port)))
-            except OSError as e:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, int(port)))
+                s.listen(1)  # with SO_REUSEADDR, two binds to the same port collide only once one listens
+            except (OSError, ValueError, TypeError) as e:  # as the start
                 why = f"cannot listen there ({e})"
         say(not why, f"listen on {addr}" + (f": {why}" if why else ""))
+    for s in bound:
+        s.close()
     say(bool(gw.url), f"jobs and user tools are told to reach the gateway at {gw.url or '(nothing: set `url` or a TCP `listen`)'}")
     if cfg.get("key_socket"):
         why = place(cfg["key_socket"])
@@ -1137,21 +1198,32 @@ def main():
         sys.exit("set `url` (or a TCP `listen` address): the jobs need an address to register at")
     handler = make_handler(gw)
     servers = []
-    for addr in gw.listen:  # e.g. the cluster's internal address, and optionally a socket file for users
-        if addr.startswith("unix:"):
-            path = os.path.expanduser(addr[5:])
-            private_place(path)
-            srv = UnixServer(path, handler)
-            os.chmod(path, 0o666)
-        else:
-            host, port = addr.rsplit(":", 1)
-            srv = TCPServer((host, int(port)), handler)
-        srv.slots = gw.conn_slots
-        servers.append(srv)
-    if cfg.get("key_socket"):
-        path = os.path.expanduser(cfg["key_socket"])
-        private_place(path)  # checked here too, so a bad place stops the start instead of a background thread
-        threading.Thread(target=gw.key_server, args=(path,), daemon=True).start()
+    key_srv = None
+    addr = None
+    try:  # everything is bound before the gateway says it listens: a problem stops the start, with the address
+        for addr in gw.listen:  # e.g. the cluster's internal address, and optionally a socket file for users
+            if addr.startswith("unix:"):
+                path = os.path.expanduser(addr[5:])
+                private_place(path)
+                srv = UnixServer(path, handler)
+                os.chmod(path, 0o666)
+            else:
+                host, port = addr.rsplit(":", 1)
+                srv = TCPServer((host, int(port)), handler)
+            srv.slots = gw.conn_slots
+            servers.append(srv)
+        if cfg.get("key_socket"):
+            addr = "key_socket " + cfg["key_socket"]
+            key_srv = gw.key_socket(os.path.expanduser(cfg["key_socket"]))
+    except (OSError, ValueError, TypeError) as e:  # TypeError/ValueError: a name or path that cannot be encoded
+        sys.exit(f"cannot listen on {addr}: {e}")
+    # Python 3.8 (and 3.9 before bpo-44434 was fixed) has glibc load libgcc_s when a thread first ends, and the
+    # process aborts if that fails for want of a file descriptor. Let one thread end now, while descriptors are free.
+    warm = threading.Thread(target=lambda: None)
+    warm.start()
+    warm.join()
+    if key_srv:
+        threading.Thread(target=gw.key_server, args=(key_srv,), daemon=True).start()
     threading.Thread(target=gw.poller, daemon=True).start()
     signal_stop = threading.Event()
 

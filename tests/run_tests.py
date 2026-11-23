@@ -387,6 +387,78 @@ def main():
         check("a key socket in /tmp is refused at start (it could be taken over first)", *refused({"key_socket": "/tmp/yawn-test-squat.sock"}, "refusing"))
         check("an unknown setting is refused at start, with its name", *refused({"idle_stop": 5}, "idle_stop"))
         check("a config without models is refused at start, without a traceback", *refused({"models": {}}, "models"))
+        check("an IPv6 listen address is refused at start, saying so", *refused({"listen": f"::1:{BASE + 6}"}, "IPv6"))
+        check("a port out of range is refused at start", *refused({"listen": "127.0.0.1:99999"}, "1-65535"))
+        check("an address already in use is refused at start, with the address",
+              *refused({"listen": f"127.0.0.1:{GWPORT}"}, f"127.0.0.1:{GWPORT}"))
+        start = refused({"listen": [f"0.0.0.0:{BASE + 6}", f"127.0.0.1:{BASE + 6}"]}, f"cannot listen on 127.0.0.1:{BASE + 6}")
+        r = subprocess.run([sys.executable, "-m", "yawn.gateway", os.path.join(W, "bad.json"), "--check"], env=ENV, cwd=W,
+                           capture_output=True, text=True, timeout=10)
+        check("two listen addresses on the same port: the start stops, and --check reports the same address",
+              start[0] and r.returncode != 0 and f"ERROR listen on 127.0.0.1:{BASE + 6}" in r.stdout, f"{start} {r.stdout[-300:]}")
+        check("a second gateway does not take over the socket file a running one listens on",
+              *refused({"listen": [f"unix:{W}/http.sock", f"127.0.0.1:{BASE + 6}"]}, "listening on it"))
+        try:
+            out = raw(os.path.join(W, "http.sock"), b"GET /v1/models HTTP/1.0\r\nAuthorization: Bearer k-alice\r\n\r\n")
+        except OSError as e:
+            out = repr(e).encode()
+        check("a second gateway refused: the running one still answers on its socket file", b" 200 " in out[:20], out[:120])
+        kp = os.path.join(W, "keys.json")
+        keys_before = open(kp).read()
+        json.dump({k: u for k, u in json.loads(keys_before).items() if u != ME}, open(kp, "w"))  # this user has no key now
+        refusal = refused({"key_socket": SOCK}, "listening on it")
+        time.sleep(1)
+        mine = [k for k, u in json.load(open(kp)).items() if u == ME]
+        open(kp, "w").write(keys_before)
+        check("a second gateway does not take over the key socket either, and looking there makes no key", refusal[0] and not mine,
+              f"{refusal} {mine}")
+        long_sock = os.path.join(W, "k" * 120 + ".sock")
+        check("a key socket that cannot be opened (path too long) stops the start: no gateway that hands out no keys",
+              *refused({"key_socket": long_sock}, "key_socket"))
+        r = subprocess.run([sys.executable, "-m", "yawn.gateway", os.path.join(W, "bad.json"), "--check"], env=ENV, cwd=W,
+                           capture_output=True, text=True, timeout=10)
+        check("a key socket path too long: --check refuses it too", r.returncode != 0 and "at most 107" in r.stdout, r.stdout[-300:])
+
+        # ---- the key socket keeps serving after running out of file descriptors for a while ----
+        k2 = os.path.join(W, "k2.sock")
+        c = {**json.load(open(os.path.join(W, "edge.json"))), "listen": f"127.0.0.1:{BASE + 6}", "key_socket": k2,
+             "usage": "fd-usage.json", "state": "fd-jobs.json", "ledger": "fd-ledger.jsonl"}
+        json.dump(c, open(os.path.join(W, "fd.json"), "w"))
+        limited = ("import os, resource, sys; r = resource.RLIMIT_NOFILE; resource.setrlimit(r, (48, resource.getrlimit(r)[1]));"
+                   " os.execv(sys.executable, [sys.executable, '-m', 'yawn.gateway', sys.argv[1]])")  # 48 file descriptors
+        fdgw = subprocess.Popen([sys.executable, "-c", limited, os.path.join(W, "fd.json")], env=ENV, cwd=W,
+                                stderr=subprocess.PIPE, text=True)
+        held = []
+        try:
+            for _ in range(50):
+                if os.path.exists(k2):
+                    break
+                time.sleep(0.1)
+            time.sleep(0.5)
+            for _ in range(80):  # more connections than it has descriptors for
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                try:
+                    s.connect(k2)
+                except OSError:
+                    s.close()
+                    break
+                held.append(s)
+            time.sleep(2)
+            for s in held:
+                s.close()
+            time.sleep(2)
+            got = tool("llm-key", "--socket", k2).strip()
+        finally:
+            fdgw.terminate()
+            try:
+                err = fdgw.communicate(timeout=10)[1]
+            except subprocess.TimeoutExpired:
+                fdgw.kill()
+                err = fdgw.communicate()[1]
+        check("out of file descriptors for a while: the key socket says so in the log and serves keys again afterwards",
+              "key socket:" in err and got.startswith("yawn-"), got[:120] + " | " + err[-200:])
+
 
         # ---- the keys file ----
         kp = os.path.join(W, "keys.json")

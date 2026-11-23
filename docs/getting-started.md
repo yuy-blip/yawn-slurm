@@ -36,7 +36,7 @@ The QoS is your decision. A QoS that yields to other jobs keeps the service from
 }
 ```
 
-- `listen`: an address that users and compute nodes can reach.
+- `listen`: an address that users and compute nodes can reach (IPv4 or a host name; IPv6 is not supported yet).
 - `key_socket`: where users get their key. Its directory must be writable only by the `llm` account.
 - `models`: the model name users will send, and the job script that serves it.
 
